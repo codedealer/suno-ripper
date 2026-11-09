@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Suno Clip Archiver
 // @namespace    https://suno.com/
-// @version      0.2.0
+// @version      0.3.0
 // @description  Adds a per-track archive button to Suno library rows, downloading the audio locally. Resolves stream URLs via Suno's own library API (no hardcoded CDN). Remembers archived tracks between runs; Shift+click forces re-download.
 // @author       you
 // @match        https://suno.com/*
@@ -39,22 +39,44 @@
   // navigation, and whenever you play a track).
   const captured = { headers: null, waiters: [] };
 
+  // Diagnostics: what has our hooking seen? Exposed on window for debugging.
+  const diag = {
+    readyStateAtStart: document.readyState,
+    fetchSeen: 0,
+    fetchWithAuth: 0,
+    xhrSeen: 0,
+    xhrWithAuth: 0,
+    lastFetchUrls: [],
+    lastXhrUrls: [],
+  };
+  window.__sunoripper = { diag, captured: () => (captured.headers ? { at: captured.headers.at } : null) };
+
+  function storeHeaders(h) {
+    const a = h.get('authorization');
+    if (!a) return;
+    captured.headers = {
+      authorization: a,
+      'browser-token': h.get('browser-token') || '',
+      'device-id': h.get('device-id') || '',
+      at: Date.now(),
+    };
+    captured.waiters.splice(0).forEach((w) => w());
+  }
+
   (function hookFetch() {
     const of = window.fetch;
     window.fetch = function (...args) {
       try {
         const input = args[0];
         const init = args[1] || {};
+        diag.fetchSeen++;
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        diag.lastFetchUrls.push(url);
+        if (diag.lastFetchUrls.length > 20) diag.lastFetchUrls.shift();
         const h = new Headers(init.headers || (input && input.headers) || {});
-        const a = h.get('authorization');
-        if (a && a.startsWith('Bearer ')) {
-          captured.headers = {
-            authorization: a,
-            'browser-token': h.get('browser-token') || '',
-            'device-id': h.get('device-id') || '',
-            at: Date.now(),
-          };
-          captured.waiters.splice(0).forEach((w) => w());
+        if (h.get('authorization')) {
+          diag.fetchWithAuth++;
+          storeHeaders(h);
         }
       } catch (e) {
         /* never break the page */
@@ -63,12 +85,48 @@
     };
   })();
 
+  (function hookXhr() {
+    const oo = XMLHttpRequest.prototype.open;
+    const os = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try {
+        diag.xhrSeen++;
+        this.__srUrl = String(url);
+        this.__srHeaders = new Headers();
+        diag.lastXhrUrls.push(this.__srUrl);
+        if (diag.lastXhrUrls.length > 20) diag.lastXhrUrls.shift();
+      } catch (e) {}
+      return oo.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+      try {
+        if (this.__srHeaders) {
+          this.__srHeaders.set(k, v);
+          if (k.toLowerCase() === 'authorization') {
+            diag.xhrWithAuth++;
+            storeHeaders(this.__srHeaders);
+          }
+        }
+      } catch (e) {}
+      return os.apply(this, arguments);
+    };
+  })();
+
+  function diagSummary() {
+    return (
+      `diag: readyStateAtStart=${diag.readyStateAtStart}, ` +
+      `fetchSeen=${diag.fetchSeen} (withAuth=${diag.fetchWithAuth}), ` +
+      `xhrSeen=${diag.xhrSeen} (withAuth=${diag.xhrWithAuth}); ` +
+      `recent fetch: [${diag.lastFetchUrls.slice(-5).map((u) => u.slice(0, 80)).join(', ')}]`
+    );
+  }
+
   function waitForToken(timeoutMs = 60000) {
     return new Promise((resolve, reject) => {
       if (captured.headers) return resolve(captured.headers);
       const t = setTimeout(() => {
         captured.waiters.splice(0);
-        reject(new Error('Could not capture session token. Interact with the page (e.g. play a track) and retry.'));
+        reject(new Error(`Could not capture session token. ${diagSummary()}`));
       }, timeoutMs);
       captured.waiters.push(() => {
         clearTimeout(t);
@@ -143,6 +201,12 @@
       const m = url.match(/^(https:\/\/[^/]+\/[^/]+)\/clip\/[0-9a-f-]{36}\./i);
       if (m) return m[1];
     }
+    // Token-free fallback: a played track leaves its m4a URL in the
+    // performance resource timeline.
+    for (const e of performance.getEntriesByType('resource')) {
+      const m = e.name.match(/^(https:\/\/[^/]+\/[^/]+)\/clip\/[0-9a-f-]{36}\.m4a/i);
+      if (m) return m[1];
+    }
     return null;
   }
 
@@ -152,7 +216,13 @@
 
     if (clipUrls.has(clipId)) return clipUrls.get(clipId);
 
-    await loadLibrary(headers);
+    // Try the library API; if the token is unavailable, fall straight through
+    // to pattern-based resolution (works after any track has been played).
+    try {
+      await loadLibrary(headers);
+    } catch (e) {
+      console.warn('[suno-archiver] library API unavailable, using fallback:', e.message);
+    }
     if (clipUrls.has(clipId)) return clipUrls.get(clipId);
 
     const prefix = learnedPattern();
@@ -261,7 +331,12 @@
 
     try {
       setButtonState(btn, 'downloading', 'Resolving + downloading…');
-      const headers = await waitForToken();
+      let headers = null;
+      try {
+        headers = await waitForToken(15000);
+      } catch (e) {
+        console.warn('[suno-archiver] no token captured, trying fallback', e.message);
+      }
       const { url, title } = await resolveMediaUrl(row, headers);
       const blob = await fetchMedia(url);
       downloadBlob(blob, `${sanitize(title)} (${clipId.slice(0, 8)}).${EXT}`);
