@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         Suno Clip Archiver
 // @namespace    https://suno.com/
-// @version      0.3.0
-// @description  Adds a per-track archive button to Suno library rows, downloading the audio locally. Resolves stream URLs via Suno's own library API (no hardcoded CDN). Remembers archived tracks between runs; Shift+click forces re-download.
+// @version      0.5.0
+// @description  Adds a per-track archive button to Suno library rows. Captures the DRM-decrypted audio (Opus-in-MP4 fragments) as the player's MediaSource buffers it, and saves it locally. One track at a time; remembers archived tracks; Shift+click forces re-download.
 // @author       you
 // @match        https://suno.com/*
-// @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-start
@@ -15,14 +14,24 @@
   'use strict';
 
   // ---- Config -------------------------------------------------------------
-  const API_BASE = 'https://suno.com/a/api';
-  const PAGE_SIZE = 100; // clips per library API page
-  const PAGE_DELAY_MS = 1500; // politeness delay between pages / downloads
-  const ARCHIVED_KEY = 'sunoripper.archivedClips'; // GM storage: clipId -> {title, at, url}
+  const ARCHIVED_KEY = 'sunoripper.archivedClips'; // clipId -> {title, at}
+  const PENDING_KEY = 'sunoripper.pendingClip';    // auto-resume after navigation
+  const MIN_BYTES = 500_000;        // sanity: a real track is bigger than this
+  const MAX_WAIT_MS = 240_000;      // give up on capture after this
+  const NO_DATA_MS = 20_000;        // no decrypted audio this soon => error
+  const SETTLE_MS = 1500;           // let final appends land after end-of-track
+  const CAPTURE_RATE = 4;           // fast-forward (muted) so streams finish quickly
+  const PENDING_TTL_MS = 10 * 60_000;
   const EXT = 'm4a';
+  // Optional local receiver (e.g. in sandboxed browsers where anchor
+  // downloads are blocked): if it answers, the capture is POSTed there
+  // instead of using the in-page anchor download.
+  const RECEIVER_URL = 'http://127.0.0.1:8765/save';
+  const RECEIVER_TIMEOUT_MS = 2000;
   // --------------------------------------------------------------------------
 
   const BTN_ATTR = 'data-sunoripper-btn';
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---- Storage -------------------------------------------------------------
   function getArchived() {
@@ -32,219 +41,271 @@
   function setArchived(map) {
     GM_setValue(ARCHIVED_KEY, map);
   }
-
-  // ---- Auth token capture ---------------------------------------------------
-  // The page keeps its JWT in memory only. We borrow the `authorization`
-  // header from the app's own periodic API calls (they fire on load, on
-  // navigation, and whenever you play a track).
-  const captured = { headers: null, waiters: [] };
-
-  // Diagnostics: what has our hooking seen? Exposed on window for debugging.
-  const diag = {
-    readyStateAtStart: document.readyState,
-    fetchSeen: 0,
-    fetchWithAuth: 0,
-    xhrSeen: 0,
-    xhrWithAuth: 0,
-    lastFetchUrls: [],
-    lastXhrUrls: [],
-  };
-  window.__sunoripper = { diag, captured: () => (captured.headers ? { at: captured.headers.at } : null) };
-
-  function storeHeaders(h) {
-    const a = h.get('authorization');
-    if (!a) return;
-    captured.headers = {
-      authorization: a,
-      'browser-token': h.get('browser-token') || '',
-      'device-id': h.get('device-id') || '',
-      at: Date.now(),
-    };
-    captured.waiters.splice(0).forEach((w) => w());
+  function getPending() {
+    const v = GM_getValue(PENDING_KEY, null);
+    return v && typeof v === 'object' && v.clipId ? v : null;
+  }
+  function setPending(v) {
+    if (v === null) GM_setValue(PENDING_KEY, null);
+    else GM_setValue(PENDING_KEY, v);
   }
 
-  (function hookFetch() {
-    const of = window.fetch;
-    window.fetch = function (...args) {
-      try {
-        const input = args[0];
-        const init = args[1] || {};
-        diag.fetchSeen++;
-        const url = typeof input === 'string' ? input : (input && input.url) || '';
-        diag.lastFetchUrls.push(url);
-        if (diag.lastFetchUrls.length > 20) diag.lastFetchUrls.shift();
-        const h = new Headers(init.headers || (input && input.headers) || {});
-        if (h.get('authorization')) {
-          diag.fetchWithAuth++;
-          storeHeaders(h);
-        }
-      } catch (e) {
-        /* never break the page */
-      }
-      return of.apply(this, args);
-    };
-  })();
-
-  (function hookXhr() {
-    const oo = XMLHttpRequest.prototype.open;
-    const os = XMLHttpRequest.prototype.setRequestHeader;
-    XMLHttpRequest.prototype.open = function (method, url) {
-      try {
-        diag.xhrSeen++;
-        this.__srUrl = String(url);
-        this.__srHeaders = new Headers();
-        diag.lastXhrUrls.push(this.__srUrl);
-        if (diag.lastXhrUrls.length > 20) diag.lastXhrUrls.shift();
-      } catch (e) {}
-      return oo.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
-      try {
-        if (this.__srHeaders) {
-          this.__srHeaders.set(k, v);
-          if (k.toLowerCase() === 'authorization') {
-            diag.xhrWithAuth++;
-            storeHeaders(this.__srHeaders);
-          }
-        }
-      } catch (e) {}
-      return os.apply(this, arguments);
-    };
-  })();
-
-  function diagSummary() {
-    return (
-      `diag: readyStateAtStart=${diag.readyStateAtStart}, ` +
-      `fetchSeen=${diag.fetchSeen} (withAuth=${diag.fetchWithAuth}), ` +
-      `xhrSeen=${diag.xhrSeen} (withAuth=${diag.xhrWithAuth}); ` +
-      `recent fetch: [${diag.lastFetchUrls.slice(-5).map((u) => u.slice(0, 80)).join(', ')}]`
-    );
-  }
-
-  function waitForToken(timeoutMs = 60000) {
-    return new Promise((resolve, reject) => {
-      if (captured.headers) return resolve(captured.headers);
-      const t = setTimeout(() => {
-        captured.waiters.splice(0);
-        reject(new Error(`Could not capture session token. ${diagSummary()}`));
-      }, timeoutMs);
-      captured.waiters.push(() => {
-        clearTimeout(t);
-        resolve(captured.headers);
-      });
-    });
-  }
-
-  async function api(path, headers, body) {
-    const res = await fetch(API_BASE + path, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        ...headers,
-      },
-      body: JSON.stringify(body || {}),
-    });
-    if (res.status === 401) throw new Error('Session expired — refresh the page and retry.');
-    if (!res.ok) throw new Error(`API ${res.status} for ${path}`);
-    return res.json();
-  }
-
-  // ---- Media URL resolution --------------------------------------------------
-  // Primary: Suno's library API returns `media_urls` with the real stream URL
-  // for every clip (https://<dist>.cloudfront.net/<ws>/clip/<id>.m4a).
-  // Fallback: derive from the row's artwork image (image_<clipId>.jpeg) using
-  // a CDN host/prefix learned from any API-provided URL we have seen.
-  const clipUrls = new Map(); // clipId -> { url, title }
-  let libLoad = null;
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  async function loadLibrary(headers) {
-    if (libLoad) return libLoad;
-    libLoad = (async () => {
-      let page = 1;
-      for (;;) {
-        const data = await api('/unified/library', headers, { page, size: PAGE_SIZE });
-        for (const feed of data.feeds || []) {
-          for (const item of feed.items || []) {
-            const c = item.content_item;
-            if (!c || c.entity_type !== 'song_schema' || !c.id) continue;
-            const m = (c.media_urls || []).find((x) => /m4a|mp3/i.test(x.url || x.content_type || ''));
-            if (m && m.url && !clipUrls.has(c.id)) {
-              clipUrls.set(c.id, { url: m.url, title: c.title });
-            }
-          }
-        }
-        const total = (data.feeds || []).reduce((n, f) => n + (f.item_count || 0), 0);
-        if (page * PAGE_SIZE >= total || !data.feeds) break;
-        page++;
-        await sleep(PAGE_DELAY_MS);
-      }
-      console.log(`[suno-archiver] library map: ${clipUrls.size} clips`);
-    })();
-    libLoad.catch(() => (libLoad = null)); // allow retry after failure
-    return libLoad;
-  }
-
+  // ---- Row helpers ---------------------------------------------------------
   function clipIdFromRow(row) {
+    // Preferred: React fiber carries the clipId as a prop directly.
+    try {
+      const key = Object.keys(row).find((k) => k.startsWith('__reactFiber$'));
+      if (key) {
+        const v = row[key].memoizedProps && row[key].memoizedProps.clipId;
+        if (typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v)) return v;
+      }
+    } catch (e) {}
+    // Fallback: artwork URL looks like https://cdn2.suno.ai/image[_large]_<clipId>.jpeg
+    // Lazy-loaded images carry the real URL in data-src.
     const img = row.querySelector('img');
-    if (!img || !img.src) return null;
-    const m = img.src.match(/image_([0-9a-f-]{36})/i);
-    return m ? m[1] : null;
-  }
-
-  function learnedPattern() {
-    // e.g. "https://d2lwuy8qc234o3.cloudfront.net/1" from any known stream URL
-    for (const { url } of clipUrls.values()) {
-      const m = url.match(/^(https:\/\/[^/]+\/[^/]+)\/clip\/[0-9a-f-]{36}\./i);
-      if (m) return m[1];
-    }
-    // Token-free fallback: a played track leaves its m4a URL in the
-    // performance resource timeline.
-    for (const e of performance.getEntriesByType('resource')) {
-      const m = e.name.match(/^(https:\/\/[^/]+\/[^/]+)\/clip\/[0-9a-f-]{36}\.m4a/i);
-      if (m) return m[1];
+    if (img) {
+      const candidates = [img.getAttribute('src'), img.getAttribute('data-src')].filter(Boolean);
+      for (const u of candidates) {
+        const m = u.match(/image(?:_large|_small|_thumb)?_([0-9a-f-]{36})/i);
+        if (m) return m[1];
+      }
     }
     return null;
   }
 
-  async function resolveMediaUrl(row, headers) {
-    const clipId = clipIdFromRow(row);
-    if (!clipId) throw new Error('No clip id found in row artwork');
-
-    if (clipUrls.has(clipId)) return clipUrls.get(clipId);
-
-    // Try the library API; if the token is unavailable, fall straight through
-    // to pattern-based resolution (works after any track has been played).
-    try {
-      await loadLibrary(headers);
-    } catch (e) {
-      console.warn('[suno-archiver] library API unavailable, using fallback:', e.message);
+  function playbarSongId() {
+    // Anchor to the playbar itself: its play/pause button's parent holds the
+    // /song/<clipId> link. The first /song/ link in DOM order is often an
+    // unrelated related-songs carousel.
+    const pb = document.querySelector('[aria-label^="Playbar:"]');
+    if (pb && pb.parentElement) {
+      const link = pb.parentElement.querySelector('a[href*="/song/"]');
+      if (link) {
+        const m = (link.getAttribute('href') || '').match(/\/song\/([0-9a-f-]{36})/i);
+        if (m) return m[1];
+      }
     }
-    if (clipUrls.has(clipId)) return clipUrls.get(clipId);
-
-    const prefix = learnedPattern();
-    if (prefix) {
-      const url = `${prefix}/clip/${clipId}.${EXT}`;
-      const probe = await probeUrl(url);
-      if (probe) return { url, title: row.getAttribute('aria-label') };
-    }
-    throw new Error('Track not found in library API — play it once, then retry');
+    return null;
   }
 
-  function probeUrl(url) {
+  function getMainAudio() {
+    // The player's audio element carries a blob: (or http) media src;
+    // the other <audio> on the page is the silent placeholder (sil-100.mp3).
+    const els = [...document.querySelectorAll('audio')];
+    return (
+      els.find((a) => a.currentSrc && a.currentSrc.startsWith('blob:')) ||
+      els.find((a) => a.currentSrc && !/sil-/.test(a.currentSrc)) ||
+      els[0] ||
+      null
+    );
+  }
+
+  // ---- Capture session ------------------------------------------------------
+  // Suno streams encrypted audio; the app decrypts it in-page and feeds the
+  // plaintext (fragmented MP4, Opus codec) to MediaSource via
+  // SourceBuffer.appendBuffer. We collect those chunks while the target track
+  // buffers and concatenate them into the complete file.
+  let session = null; // {clipId, chunks, total, firstAt, lastGrowth, blob}
+
+  (function hookAppendBuffer() {
+    const orig = SourceBuffer.prototype.appendBuffer;
+    SourceBuffer.prototype.appendBuffer = function (data) {
+      try {
+        if (session && data) {
+          let u8;
+          if (data instanceof Uint8Array) u8 = data;
+          else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+          else if (data && data.buffer instanceof ArrayBuffer)
+            u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          else if (data instanceof Blob) { u8 = null; } // rare; handled via blob path
+          if (u8 && u8.byteLength) {
+            const copy = new Uint8Array(u8.byteLength);
+            copy.set(u8);
+            session.chunks.push(copy);
+            session.total += u8.byteLength;
+            session.lastGrowth = Date.now();
+            if (!session.firstAt) session.firstAt = Date.now();
+          }
+        }
+      } catch (e) {
+        /* never break playback */
+      }
+      return orig.call(this, data);
+    };
+  })();
+
+  // Progressive-delivery fallback: if the app ever creates one big audio Blob,
+  // capture it directly.
+  (function hookCreateObjectURL() {
+    const orig = URL.createObjectURL;
+    URL.createObjectURL = function (obj) {
+      try {
+        if (session && obj instanceof Blob && obj.type && obj.type.startsWith('audio') && obj.size >= MIN_BYTES) {
+          session.blob = obj;
+          session.total = obj.size;
+          session.lastGrowth = Date.now();
+        }
+      } catch (e) {}
+      return orig.call(this, obj);
+    };
+  })();
+
+  function startSession(clipId) {
+    session = { clipId, chunks: [], total: 0, blob: null, firstAt: 0, lastGrowth: 0 };
+  }
+  function stopSession() {
+    session = null;
+  }
+
+  // ---- MP4 helpers -----------------------------------------------------------
+  // A fresh MP4 stream begins with an `ftyp` box: [size(4)] "ftyp". The first
+  // appended chunk of a from-scratch stream therefore has "ftyp" at bytes 4-7.
+  // If the player resumes an already-loaded track mid-file, the first chunk is
+  // a bare `moof` fragment — detectable and handled by navigating fresh.
+  const FTYPE = [102, 116, 121, 112]; // 'f' 't' 'y' 'p'
+  function isFtypBox(u8) {
+    return u8.length >= 8 && u8[4] === 102 && u8[5] === 116 && u8[6] === 121 && u8[7] === 112;
+  }
+
+  function concatChunks(captured) {
+    const out = new Uint8Array(captured.total);
+    let off = 0;
+    for (const c of captured.chunks) {
+      out.set(c, off);
+      off += c.length;
+    }
+    return out;
+  }
+
+  // If the player auto-advanced to the next track right after the target
+  // ended, the next track's own ftyp box is appended after our data. Split at
+  // the second ftyp box so we keep only the target file.
+  function splitAtSecondFtyp(bytes) {
+    if (!isFtypBox(bytes)) return bytes; // file doesn't even start with ftyp
+    for (let i = 8; i + 4 <= bytes.length; i++) {
+      if (bytes[i] === 102 && bytes[i + 1] === 116 && bytes[i + 2] === 121 && bytes[i + 3] === 112) {
+        // require a plausible box size (4 bytes before) to avoid false hits
+        const size = bytes[i - 4] * 16777216 + bytes[i - 3] * 65536 + bytes[i - 2] * 256 + bytes[i - 1];
+        if (size >= 8 && size < 4096) return bytes.slice(0, i - 4);
+      }
+    }
+    return bytes;
+  }
+
+  /** Verify the assembled file is a sane fragmented MP4. Returns null or an error string. */
+  function verifyMp4(bytes) {
+    if (!isFtypBox(bytes)) return 'data does not start with an ftyp box';
+    if (bytes.length < MIN_BYTES) return `file too small (${bytes.length} bytes)`;
+    const u32 = (o) => bytes[o] * 16777216 + bytes[o + 1] * 65536 + bytes[o + 2] * 256 + bytes[o + 3];
+    let o = 0;
+    let sawMoov = false;
+    let moofs = 0;
+    while (o + 8 <= bytes.length) {
+      const size = u32(o);
+      const type = String.fromCharCode(bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7]);
+      if (size < 8) return `truncated box "${type}"`;
+      if (type === 'moov') sawMoov = true;
+      if (type === 'moof') moofs++;
+      o += size;
+    }
+    if (o !== bytes.length) return 'box chain does not end cleanly';
+    if (!sawMoov) return 'no moov box found';
+    if (moofs < 2) return `too few fragments (${moofs})`;
+    return null;
+  }
+
+  // ---- Player control ----------------------------------------------------------
+  function boostPlayback() {
+    const a = getMainAudio();
+    if (!a) return;
+    try {
+      a.__srWasMuted = a.muted;
+      a.muted = true;
+      a.playbackRate = CAPTURE_RATE;
+      a.defaultPlaybackRate = CAPTURE_RATE;
+      if (a.paused) a.play().catch(() => {});
+    } catch (e) {}
+  }
+
+  function resetPlayer() {
+    const a = getMainAudio();
+    if (!a) return;
+    try {
+      a.playbackRate = 1;
+      a.defaultPlaybackRate = 1;
+      a.muted = a.__srWasMuted || false;
+      delete a.__srWasMuted;
+      if (!a.paused) a.pause();
+    } catch (e) {}
+  }
+
+  // ---- Waiting ------------------------------------------------------------------
+  /**
+   * Wait until the first decrypted chunk arrives.
+   * Returns 'fresh' (stream starts with ftyp), 'blob', or 'midfile'
+   * (player resumed an already-loaded track — needs a fresh start).
+   * Throws if no data arrives within the timeout.
+   */
+  async function waitForStreamStart(timeoutMs = NO_DATA_MS) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (session.blob) return 'blob';
+      if (session.chunks.length > 0) {
+        return isFtypBox(session.chunks[0]) ? 'fresh' : 'midfile';
+      }
+      await sleep(250);
+    }
+    throw new Error('track did not start streaming');
+  }
+
+  function waitEndEvent() {
     return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method: 'HEAD',
-        url,
-        timeout: 15000,
-        onload: (res) => resolve(res.status === 200),
-        onerror: () => resolve(false),
-        ontimeout: () => resolve(false),
-      });
+      const a = getMainAudio();
+      if (!a) { resolve('no-audio'); return; }
+      const onEnd = () => { cleanup(); resolve('ended'); };
+      const cleanup = () => a.removeEventListener('ended', onEnd);
+      a.addEventListener('ended', onEnd);
+      // safety: if the source is swapped (auto-advance), 'ended' may not fire
+      const iv = setInterval(() => {
+        if (!session) { clearInterval(iv); cleanup(); resolve('session-ended'); }
+      }, 1000);
     });
+  }
+
+  /** True if the captured bytes already contain a second file (auto-advance). */
+  function hasSecondFile(captured) {
+    if (captured.chunks.length < 2) return false;
+    const bytes = concatChunks(captured);
+    return splitAtSecondFtyp(bytes).length !== bytes.length;
+  }
+
+  /** Wait until a second ftyp box appears (auto-advance started a new track). */
+  function waitSecondFtyp() {
+    return new Promise((resolve) => {
+      const iv = setInterval(() => {
+        if (!session) { clearInterval(iv); resolve('session-ended'); return; }
+        if (hasSecondFile(session)) {
+          clearInterval(iv);
+          resolve('advanced');
+        }
+      }, 300);
+    });
+  }
+
+  /** Wait until the byte total stops growing (buffering finished). */
+  async function waitForPlateau(plateauMs = 6000, timeoutMs = 60_000) {
+    const start = Date.now();
+    let lastTotal = 0;
+    let lastChange = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await sleep(400);
+      if (session.total > lastTotal) {
+        lastTotal = session.total;
+        lastChange = Date.now();
+      }
+      if (session.total >= MIN_BYTES && Date.now() - lastChange >= plateauMs) return true;
+    }
+    return false;
   }
 
   // ---- Download ---------------------------------------------------------------
@@ -269,29 +330,231 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  function fetchMedia(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        binary: true,
-        binaryCharset: 'utf-8',
-        timeout: 180000,
-        onload: (res) => {
-          if (res.status === 200 && res.response) {
-            const bytes = Uint8Array.from(atob(res.response), (c) => c.charCodeAt(0));
-            resolve(new Blob([bytes], { type: 'audio/mp4' }));
-          } else {
-            reject(new Error(`Download failed (HTTP ${res.status})`));
-          }
-        },
-        onerror: (res) => reject(new Error(`Network error (status=${res.status})`)),
-        ontimeout: () => reject(new Error('Download timed out')),
+  /**
+   * Deliver the captured blob to disk.
+   * Prefers a local receiver when one is running (sandboxed browsers block
+   * anchor downloads); falls back to the in-page anchor download.
+   * Returns 'receiver' or 'anchor'.
+   */
+  async function deliverBlob(blob, filename) {
+    try {
+      const r = await fetch(RECEIVER_URL, {
+        method: 'POST',
+        // Percent-encode: header values must stay latin-1 (titles with
+        // curly quotes etc. would otherwise be mangled).
+        headers: { 'X-Filename': encodeURIComponent(filename), 'Content-Type': 'application/octet-stream' },
+        body: blob,
+        signal: AbortSignal.timeout(RECEIVER_TIMEOUT_MS),
       });
-    });
+      if (r.ok) {
+        console.log(`[suno-archiver] saved via receiver: ${filename}`);
+        return 'receiver';
+      }
+    } catch (e) { /* receiver not running — use the anchor */ }
+    downloadBlob(blob, filename);
+    return 'anchor';
   }
 
-  // ---- UI ----------------------------------------------------------------------
+  // ---- Archive flow ---------------------------------------------------------------
+  // Deterministic state machine (NO reload loops — at most ONE navigation):
+  //   1. If the target clip is already loaded in this document's player, a
+  //      fresh MediaSource (stream from offset 0) requires a new document,
+  //      so we navigate to the song page.
+  //   2. Otherwise we click the row's play control in place; a never-loaded
+  //      clip always starts a fresh stream from 0.
+  //   3. After start, the first appended chunk must begin with ftyp. If not
+  //      (unexpected mid-file resume), we navigate to the song page ONCE.
+  //   4. We fast-forward (muted) until the track ends. If the player
+  //      auto-advances to the next track, we split the capture at the next
+  //      file's ftyp box.
+  async function archiveClip(row, btn, force) {
+    const clipId = clipIdFromRow(row);
+    if (!clipId) {
+      setButtonState(btn, 'idle', 'Could not find clip id in artwork URL');
+      return;
+    }
+
+    const archived = getArchived();
+    if (archived[clipId] && !force) {
+      setButtonState(btn, 'archived', `Archived ${new Date(archived[clipId].at).toLocaleString()} — Shift+click to re-download`);
+      return;
+    }
+    if (session) {
+      setButtonState(btn, 'idle', 'Another archive is in progress — wait for it to finish');
+      return;
+    }
+    if (getPending()) {
+      setButtonState(btn, 'idle', 'An archive is already pending');
+      return;
+    }
+
+    const title = row.getAttribute('aria-label') || clipId;
+    const alreadyLoaded = playbarSongId() === clipId;
+    const pending = {
+      clipId,
+      title,
+      at: Date.now(),
+      returnUrl: location.href,
+      navigated: alreadyLoaded ? 1 : 0,
+    };
+    setPending(pending);
+    setButtonState(btn, 'downloading', 'Starting capture…');
+    console.log('[suno-archiver] pending', clipId, alreadyLoaded ? '(navigate fresh)' : '(in place)');
+
+    if (alreadyLoaded) {
+      setTimeout(() => (location.href = `/song/${clipId}`), 300);
+      return; // resumePending runs after navigation
+    }
+    await runCapture(clipId, title, btn, row);
+  }
+
+  /** The actual capture; runs in the current document. */
+  async function runCapture(clipId, title, btn, row) {
+    const onSongPage = new RegExp(`/song/${clipId}$`, 'i').test(location.pathname);
+    try {
+      setButtonState(btn, 'downloading', 'Buffering + capturing (muted, fast-forward)…');
+      startSession(clipId);
+
+      // Start playback.
+      if (onSongPage) {
+        const pb = document.querySelector('[aria-label="Playbar: Play button"]');
+        if (!pb) throw new Error('playbar play button not found on song page');
+        pb.click();
+      } else if (row) {
+        // The row's artwork div is the play control; a plain row.click()
+        // does NOT start playback.
+        const play =
+          row.querySelector('.clip-image-container[aria-label^="Play "]') ||
+          row.querySelector('[aria-label^="Play "]');
+        if (play) play.click();
+        else row.click();
+      } else {
+        throw new Error('no way to start playback');
+      }
+
+      const kind = await waitForStreamStart();
+
+      // Mid-file resume (unexpected): do the single fresh navigation.
+      if (kind === 'midfile') {
+        stopSession();
+        resetPlayer();
+        const p = getPending();
+        if (p && p.navigated < 1) {
+          p.navigated = 1;
+          p.at = Date.now();
+          setPending(p);
+          setButtonState(btn, 'downloading', 'Mid-file resume — navigating for a fresh start…');
+          console.log('[suno-archiver] mid-file resume detected, navigating fresh');
+          setTimeout(() => (location.href = `/song/${clipId}`), 300);
+          return;
+        }
+        throw new Error('player keeps resuming mid-file — open the song page manually and retry');
+      }
+
+      boostPlayback();
+
+      // Wait for the target track to finish.
+      const endReason = await Promise.race([
+        waitEndEvent(),
+        waitSecondFtyp(),
+        (async () => {
+          await waitForPlateau();
+          return 'plateau';
+        })(),
+        (async () => {
+          await sleep(MAX_WAIT_MS);
+          return 'timeout';
+        })(),
+      ]);
+      if (endReason === 'timeout') throw new Error('capture timed out — retry');
+
+      await sleep(SETTLE_MS); // let final appends land
+      const captured = session;
+      stopSession();
+      resetPlayer(); // don't leave the player fast-forwarding the next track
+
+      let bytes;
+      if (captured.blob) {
+        bytes = new Uint8Array(await captured.blob.arrayBuffer());
+      } else {
+        bytes = concatChunks(captured);
+        bytes = splitAtSecondFtyp(bytes);
+      }
+
+      const err = verifyMp4(bytes);
+      if (err) throw new Error(`captured data invalid: ${err}`);
+
+      const blob = new Blob([bytes], { type: 'audio/mp4' });
+      const filename = `${sanitize(title)} (${clipId.slice(0, 8)}).${EXT}`;
+      await deliverBlob(blob, filename);
+
+      const archived = getArchived();
+      archived[clipId] = { title, at: new Date().toISOString() };
+      setArchived(archived);
+
+      const returnUrl = getPending() && getPending().returnUrl;
+      setPending(null);
+      setButtonState(btn, 'archived', 'Archived — Shift+click to re-download');
+      console.log(`[suno-archiver] archived ${title} (${clipId}), ${blob.size} bytes`);
+
+      // If we navigated here, return the user to where they were.
+      if (returnUrl && returnUrl !== location.href) {
+        setTimeout(() => (location.href = returnUrl), 1500);
+      }
+    } catch (e) {
+      stopSession();
+      resetPlayer();
+      setPending(null);
+      if (btn) setButtonState(btn, 'idle', `Failed: ${e.message} — click to retry`);
+      console.error('[suno-archiver]', e);
+    }
+  }
+
+  // Auto-resume after a navigation (fresh song page, or interrupted reload).
+  async function resumePending() {
+    const pending = getPending();
+    if (!pending || Date.now() - pending.at > PENDING_TTL_MS) {
+      if (pending) setPending(null);
+      return;
+    }
+    const { clipId, title, navigated, returnUrl } = pending;
+    const onSongPage = new RegExp(`/song/${clipId}$`, 'i').test(location.pathname);
+
+    if (!onSongPage) {
+      // We expected to be on the song page but aren't (e.g., the user
+      // navigated somewhere). Go there once; if we already navigated once,
+      // give up instead of looping.
+      if (navigated < 1) {
+        pending.navigated = 1;
+        pending.at = Date.now();
+        setPending(pending);
+        setTimeout(() => (location.href = `/song/${clipId}`), 300);
+        return;
+      }
+      setPending(null);
+      console.error('[suno-archiver] not on song page and already navigated once — giving up');
+      return;
+    }
+
+    // Wait for the page to be ready (playbar play button present).
+    const deadline = Date.now() + 60_000;
+    let btn = null;
+    while (Date.now() < deadline) {
+      btn = document.querySelector('[aria-label="Playbar: Play button"]');
+      if (btn && playbarSongId() === clipId) break;
+      await sleep(1000);
+    }
+    if (!btn || playbarSongId() !== clipId) {
+      setPending(null);
+      console.error('[suno-archiver] song page did not become ready — giving up');
+      return;
+    }
+
+    await sleep(1000);
+    await runCapture(clipId, title || clipId, null, null);
+  }
+
+  // ---- UI --------------------------------------------------------------------------
   function makeButton(row) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -305,77 +568,46 @@
     ].join(';');
     btn.addEventListener('mouseenter', () => (btn.style.background = 'rgba(255,255,255,0.08)'));
     btn.addEventListener('mouseleave', () => (btn.style.background = 'transparent'));
-    btn.addEventListener('click', (e) => handleArchive(row, btn, e.shiftKey));
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't let the row's own play handler fire
+      archiveClip(row, btn, e.shiftKey);
+    });
     return btn;
   }
 
   function setButtonState(btn, state, tip) {
+    if (!btn) return;
     btn.textContent = state === 'archived' ? '✓' : state === 'downloading' ? '⋯' : '⬇';
     btn.style.color = state === 'archived' ? '#4ade80' : '#9ca3af';
     btn.disabled = state === 'downloading';
     if (tip) btn.title = tip;
   }
 
-  async function handleArchive(row, btn, force) {
-    const clipId = clipIdFromRow(row);
-    if (!clipId) {
-      setButtonState(btn, 'idle', 'Could not find clip id in artwork URL');
-      return;
-    }
-
-    const archived = getArchived();
-    if (archived[clipId] && !force) {
-      setButtonState(btn, 'archived', `Archived ${new Date(archived[clipId].at).toLocaleString()} — Shift+click to re-download`);
-      return;
-    }
-
-    try {
-      setButtonState(btn, 'downloading', 'Resolving + downloading…');
-      let headers = null;
-      try {
-        headers = await waitForToken(15000);
-      } catch (e) {
-        console.warn('[suno-archiver] no token captured, trying fallback', e.message);
-      }
-      const { url, title } = await resolveMediaUrl(row, headers);
-      const blob = await fetchMedia(url);
-      downloadBlob(blob, `${sanitize(title)} (${clipId.slice(0, 8)}).${EXT}`);
-      archived[clipId] = { title, at: new Date().toISOString(), url };
-      setArchived(archived);
-      setButtonState(btn, 'archived', 'Archived — Shift+click to re-download');
-      console.log(`[suno-archiver] archived ${title} (${clipId})`);
-    } catch (err) {
-      setButtonState(btn, 'idle', `Failed: ${err.message} — click to retry`);
-      console.error('[suno-archiver]', err);
-    }
-  }
-
   function decorate(row) {
     if (row.hasAttribute(BTN_ATTR) || row.querySelector(`[${BTN_ATTR}]`)) return;
-    if (row.getAttribute('data-clip-status') !== 'complete') return;
-    const clipId = clipIdFromRow(row);
-    if (!clipId) return;
+    if (!clipIdFromRow(row)) return;
 
     const btn = makeButton(row);
     const archived = getArchived();
-    if (archived[clipId]) {
+    if (archived[clipIdFromRow(row)]) {
       setButtonState(btn, 'archived', 'Archived — Shift+click to re-download');
     } else {
-      setButtonState(btn, 'idle', 'Archive this track locally (Shift+click to force re-download)');
+      setButtonState(btn, 'idle', 'Archive this track locally (plays it briefly, muted, to capture) — Shift+click to re-download');
     }
     row.style.position = 'relative';
     row.appendChild(btn);
   }
 
   function scan() {
-    document.querySelectorAll('[data-testid="clip-row"]').forEach(decorate);
+    document.querySelectorAll('.clip-row[role="group"]').forEach(decorate);
   }
 
   const observer = new MutationObserver(scan);
   function start() {
     observer.observe(document.body, { childList: true, subtree: true });
     scan();
-    console.log('[suno-archiver] active');
+    resumePending();
+    console.log('[suno-archiver] active v0.5.0');
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start, { once: true });
