@@ -13,18 +13,31 @@ standalone fragmented MP4.
 
 The script therefore captures the exact bytes the player consumes:
 
-1. It hooks `SourceBuffer.prototype.appendBuffer` (and falls back to
-   `URL.createObjectURL`), collecting chunks per capture session.
-2. Clicking **⬇** on a row starts playback of that track (muted, 4×
-   fast-forward so it buffers in ~1 minute instead of ~3).
-3. If the player would resume the track **mid-file**, the script performs its
-   **one allowed navigation** to the track's own page
-   (`suno.com/song/<clipId>`) to force a fresh stream from byte 0. It never
-   navigates more than once per capture, so it cannot loop.
-4. When the track ends (or the player auto-advances — the capture is then cut
-   at the next file's `ftyp` box), the script assembles the bytes, validates
-   the MP4 box structure, downloads `Title (clipid8).m4a`, and marks the clip
-   archived. If it had navigated, it returns you to the page you were on.
+1. From document start it hooks `SourceBuffer.prototype.appendBuffer`,
+   recording **all** decrypted appends and splitting the stream into complete
+   files at `ftyp` box boundaries (a new Suno stream always begins with
+   `ftyp`). Recent complete files are kept in memory (LRU, ~3 × 24 MB max),
+   so a track that is already loaded in the player is already half-captured.
+2. Clicking **⬇** on a row archives that track **in place** — no matter which
+   page you are on (create, library, …):
+   - If the track is already buffered (playing, paused, or previously played),
+     the recorded prefix is reused and the player just finishes buffering the
+     rest — **muted, 4× fast-forward, no navigation at all**.
+   - If the track is already *fully* buffered (played to the end), the file is
+     saved **instantly** with no playback.
+   - Only when the recorder has no bytes for the track at all (e.g. it was
+     loaded before the script was installed) does the script perform its one
+     allowed navigation to the track's own page (`suno.com/song/<clipId>`)
+     for a fresh stream from byte 0. It never navigates more than once per
+     capture, so it cannot loop.
+3. When the track ends, the script stops the player immediately, assembles
+   the bytes, validates the MP4 box structure and the fragment-time
+   continuity (`tfdt` base times must run without gaps), saves
+   `Title (clipid8).m4a`, and marks the clip archived. If it had navigated,
+   it returns you to the page you were on.
+4. If the player had dropped its MediaSource and re-streamed from the
+   playhead (stale prefix detected by the continuity check), the script
+   performs the one fresh navigation and re-captures cleanly.
 
 ## Install
 
@@ -37,9 +50,10 @@ The script therefore captures the exact bytes the player consumes:
 
 ## Usage
 
-- **Click ⬇** — archives the track. The player briefly plays it muted at 4×;
-  the file lands in your normal downloads folder (see *Local receiver* below
-  for sandboxed browsers).
+- **Click ⬇** — archives the track in place. If it isn't fully buffered yet,
+  the player briefly finishes it muted at 4× (no page changes); if it already
+  is, the file is saved instantly. The file lands in your normal downloads
+  folder (see *Local receiver* below for sandboxed browsers).
 - **✓** — already archived (persisted in Tampermonkey storage across runs;
   never re-downloaded).
 - **Shift+click** — force re-download.
@@ -53,9 +67,14 @@ The script therefore captures the exact bytes the player consumes:
   MP4 (`ftyp` + `moov` + `moof`/`mdat` pairs) with an Opus audio track.
   Playable by anything that handles fragmented MP4 (VLC, ffprobe, most
   modern players).
-- Capture is validated before saving: a fresh capture must start with `ftyp`,
-  contain `moov`, balanced top-level boxes, and ≥10 `moof` fragments.
-  Auto-advance contamination is stripped at the second `ftyp`.
+- Capture is validated before saving: the file must start with `ftyp`,
+  contain `moov`, have balanced top-level boxes, ≥10 `moof` fragments, and a
+  gap-free `tfdt` fragment timeline (catches stale prefixes from a
+  re-streamed MediaSource).
+- When a capture ends, the player is stopped immediately. Suno's auto-advance
+  often starts the *next* track ~1s later — the script watches for that and
+  pauses it. If you were already listening to another track while archiving a
+  finished one, that playback is left alone.
 - A pending capture survives one page navigation (e.g. the script's own
   fresh-start navigation, or you reloading the page). If the player keeps
   resuming mid-file after the single navigation, the script gives up with a
